@@ -51,5 +51,11 @@ EAPI int evil_rename(const char *src, const char *dst);
  */
 #define rename(src, dst) evil_rename(src, dst)
 
+//getline and getdelim
+EAPI ssize_t evil_getline(char **lineptr, size_t *n, FILE *stream);
+EAPI ssize_t evil_getdelim(char **lineptr, size_t *n, int delim, FILE *stream);
+
+#define getline(a, b, c)      evil_getline(a, b, c)
+#define getdelim(a, b, c, d)  evil_getdelim(a, b, c, d)
 
 #endif /* __EVIL_STDIO_H__ */
