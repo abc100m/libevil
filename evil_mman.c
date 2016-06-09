@@ -1,152 +1,179 @@
-#ifdef HAVE_CONFIG_H
-# include "config.h"
-#endif /* HAVE_CONFIG_H */
-
-#include <stdlib.h>
-#include <stdio.h>
-#include <sys/types.h>
-
-#ifndef _MSC_VER
-# include <unistd.h>
-#endif
-
-#ifndef WIN32_LEAN_AND_MEAN
-# define WIN32_LEAN_AND_MEAN
-#endif
 #include <windows.h>
-#undef WIN32_LEAN_AND_MEAN
+#include <errno.h>
+#include <io.h>
 
-# include <io.h>
-
-#include "evil_macro.h"
 #include "sys/mman.h"
-#include "evil_util.h"
-#include "evil_private.h"
 
+#ifndef FILE_MAP_EXECUTE
+#define FILE_MAP_EXECUTE    0x0020
+#endif /* FILE_MAP_EXECUTE */
 
-/***** API *****/
-
-
-void *
-mmap(void  *addr EVIL_UNUSED,
-     size_t len,
-     int    prot,
-     int    flags,
-     int    fd,
-     off_t  offset)
+static int __map_mman_error(const DWORD err, const int deferr)
 {
-   HANDLE fm;
-   DWORD  protect = PAGE_NOACCESS;
-   DWORD  acs = 0;
-   HANDLE handle;
-   void  *data;
-
-   /* support only MAP_SHARED */
-   if (!(flags & MAP_SHARED))
-     return MAP_FAILED;
-
-   if (prot & PROT_EXEC)
-     {
-        if (prot & PROT_READ)
-          {
-             if (prot & PROT_WRITE)
-               protect = PAGE_EXECUTE_READWRITE;
-             else
-               protect = PAGE_EXECUTE_READ;
-          }
-        else
-          {
-             if (prot & PROT_WRITE)
-               protect = PAGE_EXECUTE_WRITECOPY;
-             else
-               protect = PAGE_EXECUTE;
-          }
-     }
-   else
-     {
-        if (prot & PROT_READ)
-          {
-             if (prot & PROT_WRITE)
-               protect = PAGE_READWRITE;
-             else
-               protect = PAGE_READONLY;
-          }
-        else if (prot & PROT_WRITE)
-          protect = PAGE_WRITECOPY;
-     }
-
-   handle = (HANDLE)_get_osfhandle(fd);
-   if (handle == INVALID_HANDLE_VALUE)
-     {
-        fprintf(stderr, "[Evil] [mmap] _get_osfhandle failed\n");
-
-        return MAP_FAILED;
-     }
-
-   fm = CreateFileMapping(handle, NULL, protect, 0, 0, NULL);
-   if (!fm)
-     {
-        char *str;
-
-        str = evil_last_error_get();
-        fprintf(stderr, "[Evil] [mmap] CreateFileMapping failed: %s\n", str);
-        free(str);
-
-        return MAP_FAILED;
-     }
-
-   if ((protect & PAGE_READWRITE) == PAGE_READWRITE)
-     acs = FILE_MAP_ALL_ACCESS;
-   else if ((protect & PAGE_WRITECOPY) == PAGE_WRITECOPY)
-     acs = FILE_MAP_COPY;
-#if 0
-   if (protect & (PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_READ))
-     acs = FILE_MAP_EXECUTE;
-#endif
-   else if (protect & (PAGE_READWRITE | PAGE_READONLY))
-     acs = FILE_MAP_READ;
-   else
-     {
-        if ((protect & PAGE_WRITECOPY) == PAGE_WRITECOPY)
-          acs = FILE_MAP_WRITE;
-     }
-
-   data = MapViewOfFile(fm,
-                        acs,
-                        offset & 0xffff0000,
-                        offset & 0x0000ffff,
-                        len);
-   CloseHandle(fm);
-
-   if (!data)
-     {
-        char *str;
-
-        str = evil_last_error_get();
-        fprintf(stderr, "[Evil] [mmap] MapViewOfFile failed: %s\n", str);
-        free(str);
-
-        return MAP_FAILED;
-     }
-
-   return data;
+    if (err == 0)
+        return 0;
+    //TODO: implement
+    return err;
 }
 
-int
-munmap(void  *addr,
-       size_t len EVIL_UNUSED)
+static DWORD __map_mmap_prot_page(const int prot)
 {
-   BOOL res;
+    DWORD protect = 0;
+    
+    if (prot == PROT_NONE)
+        return protect;
+        
+    if ((prot & PROT_EXEC) != 0)
+    {
+        protect = ((prot & PROT_WRITE) != 0) ? 
+                    PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+    }
+    else
+    {
+        protect = ((prot & PROT_WRITE) != 0) ?
+                    PAGE_READWRITE : PAGE_READONLY;
+    }
+    
+    return protect;
+}
 
-   res = UnmapViewOfFile(addr);
-   if (!res)
-     {
-        char *str;
+static DWORD __map_mmap_prot_file(const int prot)
+{
+    DWORD desiredAccess = 0;
+    
+    if (prot == PROT_NONE)
+        return desiredAccess;
+        
+    if ((prot & PROT_READ) != 0)
+        desiredAccess |= FILE_MAP_READ;
+    if ((prot & PROT_WRITE) != 0)
+        desiredAccess |= FILE_MAP_WRITE;
+    if ((prot & PROT_EXEC) != 0)
+        desiredAccess |= FILE_MAP_EXECUTE;
+    
+    return desiredAccess;
+}
 
-        str = evil_last_error_get();
-        fprintf(stderr, "[Evil] [munmap] UnmapViewOfFile failed: %s\n", str);
-        free(str);
-     }
+void* mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
+{
+    HANDLE fm, h;
+    
+    void * map = MAP_FAILED;
+    
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4293)
+#endif
 
-   return (res == 0) ? -1 : 0;
+    const DWORD dwFileOffsetLow = (sizeof(off_t) <= sizeof(DWORD)) ? 
+                    (DWORD)off : (DWORD)(off & 0xFFFFFFFFL);
+    const DWORD dwFileOffsetHigh = (sizeof(off_t) <= sizeof(DWORD)) ?
+                    (DWORD)0 : (DWORD)((off >> 32) & 0xFFFFFFFFL);
+    const DWORD protect = __map_mmap_prot_page(prot);
+    const DWORD desiredAccess = __map_mmap_prot_file(prot);
+
+    const off_t maxSize = off + (off_t)len;
+
+    const DWORD dwMaxSizeLow = (sizeof(off_t) <= sizeof(DWORD)) ? 
+                    (DWORD)maxSize : (DWORD)(maxSize & 0xFFFFFFFFL);
+    const DWORD dwMaxSizeHigh = (sizeof(off_t) <= sizeof(DWORD)) ?
+                    (DWORD)0 : (DWORD)((maxSize >> 32) & 0xFFFFFFFFL);
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
+    errno = 0;
+    
+    if (len == 0 
+        /* Unsupported flag combinations */
+        || (flags & MAP_FIXED) != 0
+        /* Usupported protection combinations */
+        || prot == PROT_EXEC)
+    {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    
+    h = ((flags & MAP_ANONYMOUS) == 0) ? 
+                    (HANDLE)_get_osfhandle(fildes) : INVALID_HANDLE_VALUE;
+
+    if ((flags & MAP_ANONYMOUS) == 0 && h == INVALID_HANDLE_VALUE)
+    {
+        errno = EBADF;
+        return MAP_FAILED;
+    }
+
+    fm = CreateFileMapping(h, NULL, protect, dwMaxSizeHigh, dwMaxSizeLow, NULL);
+
+    if (fm == NULL)
+    {
+        errno = __map_mman_error(GetLastError(), EPERM);
+        return MAP_FAILED;
+    }
+  
+    map = MapViewOfFile(fm, desiredAccess, dwFileOffsetHigh, dwFileOffsetLow, len);
+
+    CloseHandle(fm);
+  
+    if (map == NULL)
+    {
+        errno = __map_mman_error(GetLastError(), EPERM);
+        return MAP_FAILED;
+    }
+
+    return map;
+}
+
+int munmap(void *addr, size_t len)
+{
+    if (UnmapViewOfFile(addr))
+        return 0;
+        
+    errno =  __map_mman_error(GetLastError(), EPERM);
+    
+    return -1;
+}
+
+int _mprotect(void *addr, size_t len, int prot)
+{
+    DWORD newProtect = __map_mmap_prot_page(prot);
+    DWORD oldProtect = 0;
+    
+    if (VirtualProtect(addr, len, newProtect, &oldProtect))
+        return 0;
+    
+    errno =  __map_mman_error(GetLastError(), EPERM);
+    
+    return -1;
+}
+
+int msync(void *addr, size_t len, int flags)
+{
+    if (FlushViewOfFile(addr, len))
+        return 0;
+    
+    errno =  __map_mman_error(GetLastError(), EPERM);
+    
+    return -1;
+}
+
+int mlock(const void *addr, size_t len)
+{
+    if (VirtualLock((LPVOID)addr, len))
+        return 0;
+        
+    errno =  __map_mman_error(GetLastError(), EPERM);
+    
+    return -1;
+}
+
+int munlock(const void *addr, size_t len)
+{
+    if (VirtualUnlock((LPVOID)addr, len))
+        return 0;
+        
+    errno =  __map_mman_error(GetLastError(), EPERM);
+    
+    return -1;
 }
